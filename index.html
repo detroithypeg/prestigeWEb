@@ -205,209 +205,180 @@
 
 <script>
 // ============================================================
-// 1. LOAD FRAMES WITH LIMITED CONCURRENCY & RETRIES
-//    (Prevents ERR_CONNECTION_RESET on Netlify)
+// 1. FAST FRAME LOADER (no HEAD scanning)
+//    - Define TOTAL_FRAMES below.
+//    - First 5 frames load immediately → animation starts.
+//    - Remaining frames load in background (3 at a time).
 // ============================================================
 const canvas = document.getElementById('heroCanvas');
 const ctx = canvas.getContext('2d');
 const wrap = document.getElementById('wrap');
 
+// ---------- CONFIGURE ----------
+const TOTAL_FRAMES = 1000;          // <-- change to match your actual frame count
+const START_INDEX = 0;             // first frame number (0-based or 1? we use 0-based)
+const PADDING = 5;                 // zeros padding (e.g., 5 → '00001')
+const CACHE_BUST = 'v=1';          // increment when you update images
+// --------------------------------
+
+// Detect mobile (screen width < 820 or UA)
 const isMobile = window.matchMedia('(max-width: 820px)').matches || /Mobi|Android/i.test(navigator.userAgent);
 const FRAME_FOLDER = isMobile ? 'frames-mobile/' : 'frames/';
 
-// --- CONFIGURATION ---
-const FILE_PREFIX = 'frame_';
-const FILE_EXT = 'jpg';
-const PADDING = 5;
-const START_INDEX = 2000;
+// Build frame URLs
+const frameUrls = [];
+for (let i = 0; i < TOTAL_FRAMES; i++) {
+  const num = String(i + START_INDEX).padStart(PADDING, '0');
+  frameUrls.push(`${FRAME_FOLDER}frame_${num}.jpg?${CACHE_BUST}`);
+}
 
-const MAX_CONCURRENT = 3;       // Load 3 at a time
-const DELAY_BETWEEN = 30;       // ms between starting requests
-const RETRY_COUNT = 3;          // retry failed loads
-const RETRY_DELAY = 200;        // ms between retries
-
-// --- STATE ---
-const frames = [];
-let totalFrames = 0;
+// --- State ---
+const frames = new Array(TOTAL_FRAMES); // will hold loaded Image objects
+let loadedCount = 0;
+let ready = false;
 let currentFrame = 0;
 let targetFrame = 0;
-let isReady = false;
-let animationId = null;
+let animId = null;
 
-// Helper: load image with retries
-function loadImageWithRetry(url, retries = RETRY_COUNT) {
+// --- Load a single image with retry ---
+function loadImage(url, retries = 3) {
   return new Promise((resolve, reject) => {
-    const attempt = (remaining) => {
-      const img = new Image();
-      img.decoding = 'async';
-      let loaded = false;
-      img.onload = () => {
-        loaded = true;
-        resolve(img);
-      };
+    const img = new Image();
+    img.decoding = 'async';
+    let attempted = 0;
+    const tryLoad = () => {
+      img.onload = () => resolve(img);
       img.onerror = () => {
-        if (!loaded) {
-          if (remaining > 0) {
-            setTimeout(() => attempt(remaining - 1), RETRY_DELAY);
-          } else {
-            reject(new Error('Failed to load ' + url));
-          }
+        if (attempted < retries) {
+          attempted++;
+          setTimeout(tryLoad, 200);
+        } else {
+          reject(new Error(`Failed to load ${url}`));
         }
       };
       img.src = url;
     };
-    attempt(retries);
+    tryLoad();
   });
 }
 
-// Discover frames by scanning sequentially
-async function discoverAndLoadFrames() {
-  const loaded = [];
-  let consecutiveFails = 0;
-  const MAX_FAILS = 5;
-  let idx = START_INDEX;
-  const urls = [];
-
-  console.log(`🔎 Scanning folder: ${FRAME_FOLDER}`);
-  console.log(`📁 Looking for: ${FILE_PREFIX}${String(idx).padStart(PADDING, '0')}.${FILE_EXT} ...`);
-
-  // First, collect all possible URLs until we hit 5 consecutive misses
-  while (consecutiveFails < MAX_FAILS) {
-    const name = `${FILE_PREFIX}${String(idx).padStart(PADDING, '0')}.${FILE_EXT}`;
-    const url = FRAME_FOLDER + name;
-    urls.push(url);
-    // We need to test existence; we'll load them in batches.
-    // But we don't know which exist yet, so we'll just add them.
-    // However, we can't use fetch HEAD because of CORS/Netlify issues.
-    // So we'll load sequentially with concurrency later, but we need to know the count upfront.
-    // Better: try to load each and see which ones succeed.
-    // We'll do a quick existence test using a HEAD request (but Netlify might not allow?).
-    // We'll just load them all, but with concurrency limit.
-    try {
-      // Use a lightweight fetch to check existence (HEAD)
-      const resp = await fetch(url, { method: 'HEAD' });
-      if (resp.ok) {
-        consecutiveFails = 0;
-        loaded.push(url); // we'll load the image later
-        if (loaded.length === 1) {
-          // Preload first frame to set canvas size
-          const img = await loadImageWithRetry(url);
-          if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
-            frames[0] = img; // store it
-            console.log(`✅ First frame loaded: ${url} (${canvas.width}×${canvas.height})`);
-          }
-        }
-      } else {
-        consecutiveFails++;
-      }
-    } catch (_) {
-      consecutiveFails++;
+// --- Load first N frames immediately (blocking) then start animation ---
+async function initAnimation() {
+  const FIRST_BATCH = 5;
+  // Load first batch
+  const loadPromises = [];
+  for (let i = 0; i < Math.min(FIRST_BATCH, TOTAL_FRAMES); i++) {
+    loadPromises.push(loadImage(frameUrls[i]));
+  }
+  const firstImages = await Promise.allSettled(loadPromises);
+  firstImages.forEach((result, idx) => {
+    if (result.status === 'fulfilled') {
+      frames[idx] = result.value;
+      loadedCount++;
+    } else {
+      console.warn(`⚠️ First frame ${idx} failed, will retry later.`);
     }
-    idx++;
+  });
+
+  // Set canvas size from first loaded image
+  const firstLoaded = frames.find(f => f);
+  if (firstLoaded) {
+    canvas.width = firstLoaded.naturalWidth;
+    canvas.height = firstLoaded.naturalHeight;
+  } else {
+    // fallback
+    canvas.width = 1920;
+    canvas.height = 1080;
   }
 
-  console.log(`ℹ️ Discovered ${loaded.length} frame URLs.`);
+  ready = true;
+  render(); // draw first frame
+  console.log(`🚀 Animation started with ${loadedCount} preloaded frames.`);
 
-  // Now load the remaining frames (excluding the first one we already have)
-  const remainingUrls = loaded.slice(1); // first is already loaded
-  const total = remainingUrls.length + (frames[0] ? 1 : 0);
-  totalFrames = total;
+  // Start loading the rest in the background (with concurrency)
+  loadRemainingInBackground();
+}
 
-  if (total === 0) {
-    console.error('❌ No frames found.');
-    return [];
+// --- Load remaining frames with limited concurrency ---
+async function loadRemainingInBackground() {
+  const CONCURRENCY = 3;
+  const indices = [];
+  for (let i = 0; i < TOTAL_FRAMES; i++) {
+    if (!frames[i]) indices.push(i);
   }
 
-  // Load remaining with concurrency limit
-  let loadedCount = frames[0] ? 1 : 0;
+  const total = indices.length;
+  if (total === 0) return;
+
   let index = 0;
+  let completed = 0;
 
   async function worker() {
-    while (index < remainingUrls.length) {
-      const url = remainingUrls[index++];
+    while (index < indices.length) {
+      const i = indices[index++];
       try {
-        const img = await loadImageWithRetry(url);
-        frames[loadedCount] = img;
+        const img = await loadImage(frameUrls[i]);
+        frames[i] = img;
         loadedCount++;
-        if (loadedCount % 10 === 0) {
-          console.log(`📦 Loaded ${loadedCount}/${total} frames`);
+        completed++;
+        if (completed % 10 === 0 || completed === total) {
+          console.log(`📦 Background: ${completed}/${total} frames loaded`);
         }
       } catch (err) {
-        console.warn(`⚠️ Failed to load ${url}:`, err.message);
-        // keep slot empty, but we'll just skip it
+        console.warn(`⚠️ Frame ${i} failed permanently.`);
       }
-      // small delay between starts
-      await new Promise(r => setTimeout(r, DELAY_BETWEEN));
     }
   }
 
-  // Start workers (only 3 concurrent)
   const workers = [];
-  for (let i = 0; i < Math.min(MAX_CONCURRENT, remainingUrls.length); i++) {
+  for (let w = 0; w < Math.min(CONCURRENCY, total); w++) {
     workers.push(worker());
   }
   await Promise.all(workers);
-
-  // Remove any nulls (failed loads) from frames array? Actually we want to keep indices consistent.
-  // But if some frames fail, we'll have gaps. Better to keep them as null; render will fallback to first frame.
-  console.log(`✅ Loaded ${loadedCount} frames out of ${total}`);
-  return frames.slice(0, loadedCount);
+  console.log(`✅ All ${total} background frames loaded (total loaded: ${loadedCount})`);
 }
 
+// --- Render loop ---
 function render() {
-  const frameIdx = Math.round(currentFrame);
-  const img = frames[frameIdx] || frames[0];
+  if (!ready) return;
+
+  const idx = Math.round(currentFrame);
+  const img = frames[idx] || frames.find(f => f) || null;
+
   if (img) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  } else {
+    // fallback: show placeholder
+    ctx.fillStyle = '#0b0f10';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
   }
 
   const diff = targetFrame - currentFrame;
   if (Math.abs(diff) > 0.001) {
     currentFrame += diff * 0.15;
-    animationId = requestAnimationFrame(render);
+    animId = requestAnimationFrame(render);
   } else {
     currentFrame = targetFrame;
-    animationId = null;
+    animId = null;
   }
 }
 
+// --- Scroll handler ---
 function onScroll() {
-  if (!isReady || totalFrames === 0) return;
+  if (!ready || TOTAL_FRAMES === 0) return;
   const rect = wrap.getBoundingClientRect();
   const progress = Math.max(0, Math.min(1, -rect.top / (wrap.offsetHeight - window.innerHeight)));
-  targetFrame = progress * (totalFrames - 1);
-  if (!animationId) {
-    animationId = requestAnimationFrame(render);
+  targetFrame = progress * (TOTAL_FRAMES - 1);
+  if (!animId) {
+    animId = requestAnimationFrame(render);
   }
 }
 
-(async function init() {
-  const loadedFrames = await discoverAndLoadFrames();
+// --- Start ---
+initAnimation();
 
-  if (loadedFrames.length === 0 || !frames[0]) {
-    console.error(`❌ No frames found in folder: ${FRAME_FOLDER}`);
-    canvas.width = 1920;
-    canvas.height = 1080;
-    ctx.fillStyle = '#0b0f10';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#cba365';
-    ctx.font = '20px Montserrat';
-    ctx.textAlign = 'center';
-    ctx.fillText(`Кадры не найдены в папке: ${FRAME_FOLDER}`, canvas.width/2, canvas.height/2);
-    return;
-  }
-
-  // frames array already populated
-  isReady = true;
-  currentFrame = 0;
-  targetFrame = 0;
-  render();
-  console.log(`🎬 Animation ready: ${totalFrames} frames loaded`);
-})();
-
+// Attach scroll listener (throttled)
 let ticking = false;
 window.addEventListener('scroll', () => {
   if (!ticking) {
@@ -419,10 +390,10 @@ window.addEventListener('scroll', () => {
   }
 }, { passive: true });
 
-window.addEventListener('resize', onScroll);
+window.addEventListener('resize', onScroll, { passive: true });
 
 // ============================================================
-// 2. GALLERY, MENU, FORM, REVEAL
+// 2. GALLERY, MENU, FORM, REVEAL (unchanged)
 // ============================================================
 const wg = document.getElementById('worksGrid');
 for (let n = 1; n <= 8; n++) {
